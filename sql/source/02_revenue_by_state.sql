@@ -46,69 +46,46 @@ group by product_category_name_english
 order by item_sold desc limit 10
 
 ---Q4 .What share of order items were sold by a seller in the same state as the customer?--
-select * from sellers limit 10;
-
+---share ,% => (items matching the conditions / Total Items ) * ,use condition => case when 
+select * from order_items limit 10;
 select * from orders limit 10;
-select * from customers limit 10;
+select distinct customer_state from customers limit 10;
+select distinct seller_state  from sellers limit 10;
+
+
+
+select count(*) as total_order_items,sum(case when c.customer_state = s.seller_state then 1 else 0 end) as same_state_order_items,
+round(100.0*sum(case when c.customer_state = s.seller_state then 1 else 0 end) /count(*),2 ) as same_state_share_percentage
+from orders o join customers c on o.customer_id = c.customer_id
+join order_items oi  on o.order_id = oi.order_id
+join sellers s  on oi.seller_id = s.seller_id;
+
 
 
 ---Q5.For 5 orders, show item revenue and payment total side by side — without fan-out.---
+--SUM ,compare side by side 
+select o.order_id,SUM(oi.price +oi.freight_value ) as item_revenue, SUM(op.payment_value ) as payment_total from orders o 
+join order_items oi  on o.order_id = oi.order_id 
+join order_payments op  on op.order_id  =  o.order_id 
+group by o.order_id 
+limit 5;
 
-select * from order_payments limit 10;
-SELECT
-    i.order_id,
-    i.item_revenue,
-    p.payment_total
-FROM (
-    SELECT
-        order_id,
-        SUM(price) AS item_revenue
-    FROM order_items
-    GROUP BY order_id
-) i
-JOIN (
-    SELECT
-        order_id,
-        SUM(payment_value) AS payment_total
-    FROM order_payments
-    GROUP BY order_id
-) p
-    ON i.order_id = p.order_id
-LIMIT 5;
-SELECT
-    oi.order_id,
-    SUM(DISTINCT oi.price) AS item_revenue,
-    SUM(DISTINCT op.payment_value) AS payment_total
-FROM order_items oi
-JOIN order_payments op
-    ON oi.order_id = op.order_id
-GROUP BY oi.order_id
-LIMIT 5;
 
---Q6.Find orders where payments differ from price + freight by more than 1.00.
+
+
+--Q6.Find orders where payments differ from price + freight by more than 1.00.--
+--diff -> abs ,price + freight_value from order items
 select * from order_items limit 10;
 
-SELECT
-    o.order_id,
-    SUM(oi.price + oi.freight_value) AS order_total,
-    SUM(op.payment_value) AS payment_total,
-    ROUND(
-        ABS(
-            SUM(op.payment_value)
-            - SUM(oi.price + oi.freight_value)
-        ),
-        2
-    ) AS difference
-FROM orders o
-JOIN order_items oi
-    ON o.order_id = oi.order_id
-JOIN order_payments op
-    ON o.order_id = op.order_id
-GROUP BY o.order_id
-HAVING ABS(
-    SUM(op.payment_value)
-    - SUM(oi.price + oi.freight_value)
-) > 1.00;
+select o.order_id, SUM(oi.price+ oi.freight_value  ) as total_oi, sum(op.payment_value ) as payment_total ,
+round(abs(sum(op.payment_value ) - SUM(oi.price+ oi.freight_value  ))) as difference
+from orders o 
+join order_items oi  on o.order_id = oi.order_id
+join order_payments op  on o.order_id = op.order_id
+group by o.order_id ,op.payment_value
+having abs(sum(op.payment_value ) - SUM(oi.price+ oi.freight_value  )) > 1.00;
+
+
 
 
 
