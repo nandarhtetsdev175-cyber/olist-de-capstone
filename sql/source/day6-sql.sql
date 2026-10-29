@@ -131,6 +131,38 @@ LEFT JOIN raw.orders o
   AND o.order_purchase_timestamp <  d + INTERVAL '1 day'
 GROUP BY d ORDER BY d;
 
+WITH classified_orders AS (
+    SELECT
+        CASE
+            WHEN order_delivered_customer_date IS NULL
+                THEN 'not delivered'
+            WHEN order_delivered_customer_date - order_purchase_timestamp
+                 <= INTERVAL '7 days'
+                THEN 'fast'
+            WHEN order_delivered_customer_date - order_purchase_timestamp
+                 <= INTERVAL '14 days'
+                THEN 'normal'
+            ELSE 'slow'
+        END AS delivery_bucket
+    FROM raw.orders
+),
+bucket_counts AS (
+    SELECT
+        delivery_bucket,
+        COUNT(*) AS orders
+    FROM classified_orders
+    GROUP BY delivery_bucket
+)
+SELECT
+    delivery_bucket,
+    orders,
+    ROUND(
+        100.0 * orders / (SELECT COUNT(*) FROM raw.orders),
+        1
+    ) AS pct_of_orders
+FROM bucket_counts
+ORDER BY orders DESC;
+
 
 
 
