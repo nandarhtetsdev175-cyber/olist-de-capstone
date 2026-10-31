@@ -176,6 +176,48 @@ from customer_orders
 where rn = 1
 order by customer_unique_id;
 
+with customer_orders as (
+    select
+        c.customer_unique_id,
+        o.order_id,
+        o.order_purchase_timestamp,
+       rank() OVER (
+            partition by  c.customer_unique_id
+             order by  o.order_purchase_timestamp, o.order_id
+        ) AS rn,
+        count(*) over (
+             partition by c.customer_unique_id
+        ) as total_orders
+    from orders o
+    join customers c
+        on o.customer_id = c.customer_id
+)
+select
+    customer_unique_id,
+    order_purchase_timestamp::date as first_order_date,
+    total_orders
+from customer_orders
+where rn = 1
+order by customer_unique_id;
+
+select * from (
+select
+        c.customer_unique_id,
+        MIN(o.order_purchase_timestamp) as first_order,
+        rank() over( partition by  c.customer_unique_id
+             order by  o.order_purchase_timestamp)  as date_rem,
+             count(order_id) over (
+             partition by c.customer_unique_id
+        ) as total_orders
+        
+    from orders o
+    join customers c
+        on o.customer_id = c.customer_id
+       
+    group by c.customer_unique_id ,o.order_id
+    order by first_order) a where date_rem = 1
+
+
 --Q3.For each seller, show how their revenue adds up over time, order by order.
 
 -- running revenue for each seller, order by order
