@@ -218,6 +218,7 @@ select
     order by first_order) a where date_rem = 1
 
 
+
 --Q3.For each seller, show how their revenue adds up over time, order by order.
 
 -- running revenue for each seller, order by order

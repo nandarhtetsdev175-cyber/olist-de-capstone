@@ -1,0 +1,5 @@
+{
+  "orders": "FileNotFoundError: [Errno 2] No such file or directory: '/Users/user/Working/NDH/olist-de-capstone/data/raw/olist_orders_datasetd.csv'",
+  "customers": "FileNotFoundError: [Errno 2] No such file or directory: '/Users/user/Working/NDH/olist-de-capstone/data/raw/olist_customers_datasetd.csv'",
+  "order_items": "FileNotFoundError: [Errno 2] No such file or directory: '/Users/user/Working/NDH/olist-de-capstone/data/raw/olist_order_items_datasetd.csv'"
+}
