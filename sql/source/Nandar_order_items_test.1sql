@@ -1,0 +1,300 @@
+-- =====================================================================
+-- TEST SCRIPT for staging.load_order_items_incremental()
+-- Run one step at a time and compare with the "expect" comment.
+-- Use a homework/test database only: it truncates staging.order_items,
+-- drops constraints, renames a column and deletes rows.
+--
+-- Test rows use order_item_id >= 900 and shipping_limit_date in 2030.
+-- =====================================================================
+
+
+-- =====================================================================
+-- STEP 0: BACKUPS (run once, before anything else)
+--   etl_control : watermark   -> restored in STEP 11
+--   etl_log     : run history -> optional restore at the very end
+--   rejected_rows             -> optional restore at the very end
+-- =====================================================================
+DROP TABLE IF EXISTS staging.etl_control_backup;
+CREATE TABLE staging.etl_control_backup AS SELECT * FROM staging.etl_control;
+
+DROP TABLE IF EXISTS staging.etl_log_backup;
+CREATE TABLE staging.etl_log_backup AS SELECT * FROM staging.etl_log;
+
+DROP TABLE IF EXISTS staging.rejected_rows_backup;
+CREATE TABLE staging.rejected_rows_backup AS SELECT * FROM staging.rejected_rows;
+
+SELECT 'etl_control'   AS backup_of, COUNT(*) AS rows FROM staging.etl_control_backup
+UNION ALL
+SELECT 'etl_log',       COUNT(*) FROM staging.etl_log_backup
+UNION ALL
+SELECT 'rejected_rows', COUNT(*) FROM staging.rejected_rows_backup;
+
+
+-- =====================================================================
+-- STEP 1: RESET TO A FRESH STATE
+--   Watermark back to 1900 and an empty staging.order_items,
+--   so the first CALL is a full load.
+-- =====================================================================
+SELECT * FROM staging.etl_control;
+
+UPDATE staging.etl_control
+SET last_loaded_ts = '1900-01-01 00:00:00'
+WHERE table_name = 'order_items';
+
+TRUNCATE TABLE staging.order_items;
+
+SELECT * FROM staging.etl_control WHERE table_name = 'order_items';  -- 1900-01-01
+SELECT COUNT(*) FROM raw.order_items;       -- 112650
+SELECT COUNT(*) FROM staging.order_items;   -- 0
+
+
+-- =====================================================================
+-- STEP 2: FIRST CALL = FULL LOAD
+--   Expect: read 112650, loaded 112650, rejected 0
+--           watermark 1900-01-01 -> max real shipping_limit_date
+-- =====================================================================
+CALL staging.load_order_items_incremental();
+
+SELECT log_id, step_name, status, rows_read, rows_loaded, rows_rejected,
+       watermark_from, watermark_to
+FROM staging.etl_log
+ORDER BY log_id DESC LIMIT 1;
+
+SELECT COUNT(*) FROM staging.order_items;   -- 112650
+
+-- Save the post-full-load watermark as the baseline we restore at the end
+DROP TABLE IF EXISTS staging.etl_control_baseline;
+CREATE TABLE staging.etl_control_baseline AS
+    SELECT * FROM staging.etl_control WHERE table_name = 'order_items';
+
+SELECT * FROM staging.etl_control_baseline;
+
+
+-- =====================================================================
+-- STEP 3: FAKE PARENTS
+--   They exist in RAW only (to satisfy the raw foreign keys) and NOT in
+--   staging, so ORPHAN_ORDER / ORPHAN_PRODUCT fire.
+-- =====================================================================
+INSERT INTO raw.orders (order_id, customer_id, order_status, order_purchase_timestamp)
+VALUES ('missing_order',
+        (SELECT customer_id FROM raw.customers LIMIT 1),
+        'delivered', TIMESTAMP '2030-01-01 10:00:00')
+ON CONFLICT (order_id) DO NOTHING;
+
+INSERT INTO raw.products (product_id)
+VALUES ('missing_product')
+ON CONFLICT (product_id) DO NOTHING;
+
+SELECT
+    EXISTS (SELECT 1 FROM raw.orders       WHERE order_id   = 'missing_order')   AS raw_order,
+    EXISTS (SELECT 1 FROM staging.orders   WHERE order_id   = 'missing_order')   AS staging_order,
+    EXISTS (SELECT 1 FROM raw.products     WHERE product_id = 'missing_product') AS raw_product,
+    EXISTS (SELECT 1 FROM staging.products WHERE product_id = 'missing_product') AS staging_product;
+-- expect: true, false, true, false
+
+
+-- =====================================================================
+-- STEP 4: RELAX RAW CONSTRAINTS FOR THE TEST (restored in STEP 11)
+--   drop PK        -> allows the duplicate key (906)
+--   drop NOT NULL  -> allows the NULL key (901)
+-- =====================================================================
+ALTER TABLE raw.order_items DROP CONSTRAINT IF EXISTS order_items_pkey;
+ALTER TABLE raw.order_items ALTER COLUMN order_id DROP NOT NULL;
+
+SELECT attname, attnotnull
+FROM pg_attribute
+WHERE attrelid = 'raw.order_items'::regclass
+  AND attname IN ('order_id', 'order_item_id');
+-- order_id must show attnotnull = false before STEP 5
+
+
+-- =====================================================================
+-- STEP 5: INSERT TEST ROWS INTO raw.order_items
+--   900 = clean row             -> loaded, total_value = 110.00
+--   901 = NULL order_id         -> NULL_KEY
+--   902 = price 0               -> INVALID_PRICE
+--   903 = freight -1            -> NEGATIVE_FREIGHT
+--   904 = order not in staging  -> ORPHAN_ORDER
+--   905 = product not in staging-> ORPHAN_PRODUCT
+--   906 = duplicate key x2      -> only the LATER shipping_limit_date wins
+-- =====================================================================
+INSERT INTO raw.order_items
+       (order_id, order_item_id, product_id, seller_id,
+        shipping_limit_date, price, freight_value)
+VALUES
+    ((SELECT order_id   FROM staging.orders   LIMIT 1), 900,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '100.00', '10.00'),
+
+    (NULL, 901,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '10.00', '1.00'),
+
+    ((SELECT order_id   FROM staging.orders   LIMIT 1), 902,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '0.00', '1.00'),
+
+    ((SELECT order_id   FROM staging.orders   LIMIT 1), 903,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '10.00', '-1.00'),
+
+    ('missing_order', 904,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '10.00', '1.00'),
+
+    ((SELECT order_id FROM staging.orders LIMIT 1), 905,
+     'missing_product',
+     (SELECT seller_id FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '10.00', '1.00'),
+
+    ((SELECT order_id   FROM staging.orders   LIMIT 1), 906,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-10 10:00:00', '50.00', '5.00'),
+    ((SELECT order_id   FROM staging.orders   LIMIT 1), 906,
+     (SELECT product_id FROM staging.products LIMIT 1),
+     (SELECT seller_id  FROM staging.order_items LIMIT 1),
+     '2030-01-11 10:00:00', '60.00', '6.00');
+
+SELECT COUNT(*) FROM raw.order_items WHERE order_item_id >= 900;   -- 8
+
+
+-- =====================================================================
+-- STEP 6: RUN THE PROCEDURE  -> SCREENSHOT 1 (etl_log)
+--   Expect: read 7, loaded 2, rejected 5   (7 = 2 + 5)
+--           watermark -> 2030-01-11 10:00:00
+--   7 deduplicated rows: 8 raw test rows minus 1 duplicate (906)
+-- =====================================================================
+CALL staging.load_order_items_incremental();
+
+SELECT log_id, step_name, status, rows_read, rows_loaded, rows_rejected,
+       watermark_from, watermark_to
+FROM staging.etl_log
+ORDER BY log_id DESC LIMIT 1;
+
+
+-- =====================================================================
+-- STEP 7: VERIFY THE CLEAN ROWS
+--   900: total_value = 110.00
+--   906: ONE row, shipping_limit_ts = 2030-01-11, total_value = 66.00
+-- =====================================================================
+SELECT order_id, order_item_id, shipping_limit_ts, price, freight_value, total_value
+FROM staging.order_items
+WHERE order_item_id IN (900, 906);
+
+
+-- =====================================================================
+-- STEP 8: VERIFY THE REJECTS  -> SCREENSHOT 2 (rejected_rows)
+--   Expect 5 rows:
+--     901 NULL_KEY (business_key is NULL because order_id is NULL)
+--     902 INVALID_PRICE   903 NEGATIVE_FREIGHT
+--     904 ORPHAN_ORDER    905 ORPHAN_PRODUCT
+-- =====================================================================
+SELECT business_key, reason, row_data->>'order_item_id' AS order_item_id
+FROM staging.rejected_rows
+WHERE table_name = 'order_items'
+ORDER BY reject_id DESC LIMIT 10;
+
+
+-- =====================================================================
+-- STEP 9: SECOND RUN READS 0 ROWS (incremental proof)
+--   Expect: read 0, loaded 0, rejected 0
+-- =====================================================================
+CALL staging.load_order_items_incremental();
+
+SELECT status, rows_read, rows_loaded, rows_rejected
+FROM staging.etl_log
+ORDER BY log_id DESC LIMIT 1;
+
+
+-- =====================================================================
+-- STEP 10: FORCED FAILURE -> FAILED logged, watermark does NOT move
+--   Do NOT call the procedure again after renaming the column back,
+--   otherwise item 907 loads and the watermark moves to 2030-01-12.
+-- =====================================================================
+SELECT last_loaded_ts AS wm_before_failure
+FROM staging.etl_control WHERE table_name = 'order_items';   -- 2030-01-11
+
+INSERT INTO raw.order_items
+       (order_id, order_item_id, product_id, seller_id,
+        shipping_limit_date, price, freight_value)
+VALUES ((SELECT order_id   FROM staging.orders   LIMIT 1), 907,
+        (SELECT product_id FROM staging.products LIMIT 1),
+        (SELECT seller_id  FROM staging.order_items LIMIT 1),
+        '2030-01-12 10:00:00', '10.00', '1.00');
+
+ALTER TABLE raw.order_items RENAME COLUMN price TO price_tmp;   -- break it
+
+CALL staging.load_order_items_incremental();   -- WARNING: FAILED: column "price" does not exist
+
+SELECT status, message
+FROM staging.etl_log
+ORDER BY log_id DESC LIMIT 1;                  -- status = FAILED
+
+SELECT last_loaded_ts AS wm_after_failure
+FROM staging.etl_control WHERE table_name = 'order_items';   -- still 2030-01-11
+
+ALTER TABLE raw.order_items RENAME COLUMN price_tmp TO price;   -- fix it
+
+
+-- =====================================================================
+-- STEP 11: CLEAN UP AND RESTORE
+--   Take your screenshots BEFORE this step.
+-- =====================================================================
+DELETE FROM raw.order_items     WHERE order_item_id >= 900;
+DELETE FROM staging.order_items WHERE order_item_id >= 900;
+
+-- only the rejects created by this test
+DELETE FROM staging.rejected_rows
+WHERE table_name = 'order_items'
+  AND (business_key IS NULL
+       OR (row_data->>'order_item_id')::INT >= 900);
+
+-- fake raw-only parents
+DELETE FROM raw.orders   WHERE order_id   = 'missing_order';
+DELETE FROM raw.products WHERE product_id = 'missing_product';
+
+-- restore NOT NULL and the PK (NULL and duplicate rows are gone now)
+DELETE FROM raw.order_items WHERE order_id IS NULL;
+ALTER TABLE raw.order_items ALTER COLUMN order_id SET NOT NULL;
+ALTER TABLE raw.order_items
+    ADD CONSTRAINT order_items_pkey PRIMARY KEY (order_id, order_item_id);
+
+-- restore the watermark to its value right after the full load (STEP 2)
+UPDATE staging.etl_control c
+SET last_loaded_ts = b.last_loaded_ts
+FROM staging.etl_control_baseline b
+WHERE c.table_name = b.table_name
+  AND c.table_name = 'order_items';
+
+
+-- =====================================================================
+-- STEP 12: FINAL CHECKS
+-- =====================================================================
+SELECT * FROM staging.etl_control;                                      -- order_items = baseline
+SELECT COUNT(*) FROM raw.order_items     WHERE order_item_id >= 900;    -- 0
+SELECT COUNT(*) FROM staging.order_items WHERE order_item_id >= 900;    -- 0
+SELECT COUNT(*) FROM staging.order_items;                               -- 112650
+
+SELECT conname FROM pg_constraint
+WHERE conrelid = 'raw.order_items'::regclass AND contype = 'p';         -- order_items_pkey
+
+
+-- =====================================================================
+-- OPTIONAL: undo the test's footprint in etl_log / rejected_rows
+--   (skip if you want to keep the log as evidence for your teacher)
+-- =====================================================================
+-- DELETE FROM staging.etl_log
+-- WHERE log_id > (SELECT COALESCE(MAX(log_id), 0) FROM staging.etl_log_backup);
+--
+-- DELETE FROM staging.rejected_rows
+-- WHERE reject_id > (SELECT COALESCE(MAX(reject_id), 0) FROM staging.rejected_rows_backup);
+
+-- OPTIONAL: drop the helper tables when you are completely done
+-- DROP TABLE IF EXISTS staging.etl_control_backup, staging.etl_control_baseline,
+--                      staging.etl_log_backup, staging.rejected_rows_backup;

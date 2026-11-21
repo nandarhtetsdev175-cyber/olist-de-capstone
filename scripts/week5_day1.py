@@ -1,31 +1,7 @@
-from datetime import datetime
+import os
+from dotenv import load_dotenv
 
-print("A")          # 1. runs        -> A
+load_dotenv()        # read .env into environment variables
 
-def extract():
-    print("B")      # 2. skipped: only defined
-
-print("C")          # 3. runs        -> C
-
-extract()   
-# 4. called now  -> B
-a = [1, 2]
-b = a            # same object, two names
-b.append(3)
-print(a)         # [1, 2, 3]
-
-c = a.copy()     # a new object
-c.append(4)
-print(a)         
-
-
-
-def calc_delivery_days(purchase, delivered):
-    """Return days between purchase and delivery."""
-    days = (delivered - purchase).days
-    return days
-
-start = datetime(2018, 1, 1)
-end = datetime(2018, 1, 8)
-result = calc_delivery_days(start, end)
-print(result)   # 7
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("postgres")   
